@@ -1,0 +1,10 @@
+{
+  "name": "collab-cue",
+  "version": "0.1.0",
+  "description": "Cue-based review protocol for two agents sharing one file. Zero dependencies.",
+  "type": "module",
+  "private": true,
+  "bin": { "collab-cue": "bin/collab-cue.mjs" },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
