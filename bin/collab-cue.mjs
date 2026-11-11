@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 const PROTOCOL = 1;
 const SETTLE_SECONDS = 180;
@@ -39,6 +40,12 @@ let io = {
   stdin: () => {
     if (process.stdin.isTTY) die('no entry on stdin: pipe one in, or pass --file <path>');
     return fs.readFileSync(0, 'utf8');
+  },
+  // Runs the agent for `watch`. Injected in selftest so it needs no child processes.
+  exec: (cmd, { cwd, env }) => {
+    const r = spawnSync(cmd, { shell: true, stdio: 'inherit', cwd, env });
+    if (r.error) io.err(`collab-cue: cannot run --exec: ${r.error.message}\n`);
+    return r.status;
   },
 };
 
@@ -60,6 +67,7 @@ const CMDS = {
   status: [['as'], ['json']],
   wait: [['as', 'timeout', 'poll'], []],
   next: [['as'], []],
+  watch: [['as', 'exec', 'poll', 'timeout', 'max-runs'], []],
   brief: [['as'], []],
   gate: [['as', 'ids'], []],
   ack: [['as'], []],
@@ -376,24 +384,74 @@ function cmdGate({ root, report, as, ids }) {
   throw new Exit(g.ready ? 0 : 1);
 }
 
-/** One line that says what to do this turn, so an agent needs no judgement to pick the next step. */
-function cmdNext({ root, report, as }) {
-  needAs(as);
-  const p = paths(root, report);
-  const say = (action, detail, advice) => io.out(`NEXT ${action}${detail ? ` ${detail}` : ''} - ${advice}\n`);
+/** What this turn is for. `action` is one of round, answer, settling, wait, standby, human, closed. */
+function decideNext(p, as) {
+  const d = (action, detail, advice) => ({ action, line: `NEXT ${action}${detail ? ` ${detail}` : ''} - ${advice}` });
   if (isClosed(readReport(p).text)) {
-    return say('closed', '', 'the collaboration is closed. Ask the human whether to continue with the remaining tasks; do not reopen on your own');
+    return d('closed', '', 'the collaboration is closed. Ask the human whether to continue with the remaining tasks; do not reopen on your own');
   }
   const { cue, rung } = cueState(p, as);
   const note = JSON.stringify(cue?.note ?? '');
-  if (cue?.kind === 'human' && cue.from === as) return say('human', `note=${note}`, 'you asked the human for something. Stop until they reply, then ring normally');
-  if (rung && cue.kind === 'human') return say('standby', `from=${cue.from} note=${note}`, `${cue.from} is waiting on the human. Do not start a round`);
-  if (!rung) return say('wait', '', 'nothing is owed to the other agent. Stop, or run `wait` as a background job');
+  if (cue?.kind === 'human' && cue.from === as) return d('human', `note=${note}`, 'you asked the human for something. Stop until they reply, then ring normally');
+  if (rung && cue.kind === 'human') return d('standby', `from=${cue.from} note=${note}`, `${cue.from} is waiting on the human. Do not start a round`);
+  if (!rung) return d('wait', '', 'nothing is owed to the other agent. Stop, or run `wait` as a background job');
   const g = gateState(p, as);
-  if (g.reason === 'still-changing') return say('settling', `age=${g.age}s`, 'the other agent may still be writing. Check again shortly; do not read it yet');
-  if (g.reason === 'answers-incomplete') return say('answer', `from=${cue.from} missing=${g.missing.join(',')}`, 'answer only the missing ids in your next entry');
-  if (g.ready) return say('round', `from=${cue.from} expect=${(cue.expect ?? []).join(',') || '-'}`, 'review the other agent\'s latest entry (`tail`), answer every id, then append, commit, ack, ring');
-  return say('wait', `reason=${g.reason}`, 'nothing for you to review yet');
+  if (g.reason === 'still-changing') return d('settling', `age=${g.age}s`, 'the other agent may still be writing. Check again shortly; do not read it yet');
+  if (g.reason === 'answers-incomplete') return d('answer', `from=${cue.from} missing=${g.missing.join(',')}`, 'answer only the missing ids in your next entry');
+  if (g.ready) return d('round', `from=${cue.from} expect=${(cue.expect ?? []).join(',') || '-'}`, 'review the other agent\'s latest entry (`tail`), answer every id, then append, commit, ack, ring');
+  return d('wait', `reason=${g.reason}`, 'nothing for you to review yet');
+}
+
+/** One line that says what to do this turn, so an agent needs no judgement to pick the next step. */
+function cmdNext({ root, report, as }) {
+  needAs(as);
+  io.out(decideNext(paths(root, report), as).line + '\n');
+}
+
+/**
+ * Keep one agent turning without a human: wait for the other side to ring, run --exec (the agent's
+ * headless command) when a round or answer is owed, and go back to waiting. This is the outside
+ * process that wakes an agent; the agent cannot wake itself. It stops, and leaves the restart to a
+ * human, when: the agent asked the human or the collaboration closed (exit 0), a run made no
+ * progress or --max-runs is reached (exit 1), --exec fails (exit 2), or --timeout passes (exit 3).
+ * --exec gets COLLAB_AS and COLLAB_NEXT in its environment and runs in the project root.
+ */
+function cmdWatch({ root, report, as, exec, poll = '15', timeout = '3600', maxRuns = '10' }) {
+  needAs(as);
+  if (!exec) die('--exec <command> is required: the command that runs your agent for one turn');
+  const every = Number(poll);
+  const limit = Number(timeout);
+  const cap = Number(maxRuns);
+  if (!Number.isFinite(every) || every <= 0) die(`--poll must be a number of seconds > 0 (got '${poll}')`);
+  if (!Number.isFinite(limit) || limit < 0) die(`--timeout must be a number of seconds >= 0 (got '${timeout}')`);
+  if (!Number.isInteger(cap) || cap < 1) die(`--max-runs must be an integer >= 1 (got '${maxRuns}')`);
+  const p = paths(root, report);
+  const deadline = Date.now() + limit * 1000;
+  let runs = 0;
+  const stop = (reason, code) => {
+    io.out(`WATCH stop reason=${reason} runs=${runs}\n`);
+    throw new Exit(code);
+  };
+  const owed = (d) => d.action === 'round' || d.action === 'answer';
+  const mark = () => `${readJson(p.cue, {}).seq ?? 0}:${readReport(p).sha}`;
+
+  for (;;) {
+    const d = decideNext(p, as);
+    if (d.action === 'closed' || d.action === 'human') stop(d.action, 0);
+    if (owed(d)) {
+      if (runs >= cap) stop('max-runs', 1);
+      runs++;
+      io.out(`WATCH run=${runs} ${d.line}\n`);
+      const before = mark();
+      const status = io.exec(exec, { cwd: root, env: { ...process.env, COLLAB_AS: as, COLLAB_NEXT: d.line } });
+      if (status !== 0) { io.err(`collab-cue: --exec exited with ${status}\n`); stop('exec-failed', 2); }
+      if (owed(decideNext(p, as)) && mark() === before) stop('no-progress', 1);
+      continue;
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) stop('timeout', 3);
+    sleep(Math.min(every * 1000, left));
+  }
 }
 
 /** The instructions an agent needs, with its name filled in. Paste into that agent's prompt. */
@@ -521,11 +579,11 @@ function cmdClose({ root, report, as, open }) {
 /* ------------------------------------------------------------------ selftest */
 
 /** Run the real CLI in-process and capture what it would have printed and exited with. */
-function runCli(argv, { stdin = '' } = {}) {
+function runCli(argv, { stdin = '', exec } = {}) {
   const saved = io;
   let out = '';
   let err = '';
-  io = { out: (s) => { out += s; }, err: (s) => { err += s; }, stdin: () => stdin };
+  io = { out: (s) => { out += s; }, err: (s) => { err += s; }, stdin: () => stdin, exec: exec ?? (() => { throw new Error('no exec in this context'); }) };
   let code = 0;
   try { dispatch(argv); }
   catch (x) {
@@ -613,6 +671,37 @@ a${String.fromCharCode(code)}b
     t('status is quiet after ack', /state=quiet/.test(run(['status', '--as', 'amy']).out));
     run(['ring', '--as', 'dsh', '--expect', 'R-1']);
     t('a re-ring for the same bytes is rung again (F4)', /state=rung .*expect=R-1/.test(run(['status', '--as', 'amy']).out));
+
+    /* watch */
+    const watchRun = (extra, exec) => runCli(['watch', '--as', 'amy', '--exec', 'agent', '--poll', '0.05', '--timeout', '0.4', ...extra, '--root', dir], { exec });
+    const dshRings = () => { app('dsh', '### DSH - r\n| R-1 | ACCEPT | a |\n'); run(['ring', '--as', 'dsh', '--expect', 'R-1', '--final']); };
+    const amyReplies = () => { app('amy', '### Amy - reply\n| R-1 | ACCEPT | b |\n'); run(['commit', '--as', 'amy']); run(['ack', '--as', 'amy']); run(['ring', '--as', 'amy', '--expect', 'R-1', '--final']); };
+    fresh();
+    t('watch needs --exec', run(['watch', '--as', 'amy']).code === 2);
+    t('watch rejects a bad --max-runs', run(['watch', '--as', 'amy', '--exec', 'x', '--max-runs', '0']).code === 2);
+    dshRings();
+    let calls = 0;
+    let seen = null;
+    let w = watchRun([], (cmd, o) => { calls++; seen = { cmd, as: o.env.COLLAB_AS, next: o.env.COLLAB_NEXT }; amyReplies(); return 0; });
+    t('watch runs the agent once for an owed round, then waits and times out (exit 3)', w.code === 3 && calls === 1 && /WATCH run=1 NEXT round/.test(w.out) && /reason=timeout runs=1/.test(w.out));
+    t('the agent gets COLLAB_AS and COLLAB_NEXT', seen && seen.cmd === 'agent' && seen.as === 'amy' && /^NEXT round /.test(seen.next));
+    fresh(); dshRings(); calls = 0;
+    w = watchRun([], () => { calls++; return 0; });
+    t('watch stops with exit 1 when a run makes no progress', w.code === 1 && calls === 1 && /reason=no-progress/.test(w.out));
+    fresh(); dshRings(); calls = 0;
+    w = watchRun(['--max-runs', '2', '--timeout', '5'], () => { calls++; amyReplies(); dshRings(); return 0; });
+    t('watch stops with exit 1 at --max-runs', w.code === 1 && calls === 2 && /reason=max-runs runs=2/.test(w.out));
+    fresh(); dshRings(); calls = 0;
+    w = watchRun([], () => { calls++; return 3; });
+    t('watch stops with exit 2 when --exec fails', w.code === 2 && /reason=exec-failed/.test(w.out) && /exited with 3/.test(w.err));
+    fresh(); dshRings(); calls = 0;
+    w = watchRun([], () => { calls++; run(['ring', '--as', 'amy', '--kind', 'human', '--note', 'need the key']); return 0; });
+    t('watch stops with exit 0 once the agent asks the human', w.code === 0 && /reason=human/.test(w.out) && calls === 1);
+    fresh(); dshRings(); amyReplies(); run(['close', '--as', 'amy', '--open', '0']); calls = 0;
+    w = watchRun([], () => { calls++; return 0; });
+    t('watch stops with exit 0 when closed, without running the agent', w.code === 0 && /reason=closed runs=0/.test(w.out) && calls === 0);
+    fresh();
+    t('watch times out when nothing rings', watchRun([], () => { throw new Error('should not run'); }).code === 3);
 
     /* --as fallback, brief, init hint */
     fresh();
@@ -729,7 +818,7 @@ a${String.fromCharCode(code)}b
 
 /* ------------------------------------------------------------------ main */
 
-const USAGE = 'collab-cue <init|brief|ring|status|next|wait|gate|ack|commit|append|tail|close|selftest> [--root dir] [--report file] [--as agent] [--expect ids] [--final] [--json] [--file path] [--open n] [--ids ids] [--timeout s] [--poll s]\n';
+const USAGE = 'collab-cue <init|brief|ring|status|next|wait|watch|gate|ack|commit|append|tail|close|selftest> [--root dir] [--report file] [--as agent] [--expect ids] [--final] [--json] [--file path] [--open n] [--ids ids] [--timeout s] [--poll s] [--exec cmd] [--max-runs n]\n';
 
 function dispatch(argv) {
   const cmd = argv[0];
@@ -743,6 +832,7 @@ function dispatch(argv) {
     case 'status': return cmdStatus({ ...a, json: f.json });
     case 'next': return cmdNext(a);
     case 'brief': return cmdBrief(a);
+    case 'watch': return cmdWatch({ ...a, exec: f.exec, poll: f.poll, timeout: f.timeout, maxRuns: f['max-runs'] });
     case 'wait': return cmdWait({ ...a, timeout: f.timeout, poll: f.poll });
     case 'gate': return cmdGate({ ...a, ids: f.ids });
     case 'ack': return cmdAck(a);
