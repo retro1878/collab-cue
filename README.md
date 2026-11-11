@@ -9,6 +9,7 @@ tooling can still participate by reading `collab/cue.json`.
 collab-cue init       create collab/ and the report stub
 collab-cue brief      --as me   print the instructions to paste into that agent's prompt
 collab-cue next       --as me   one line: what to do this turn (round, answer, wait, human, closed ...)
+collab-cue watch      --as me --exec "<agent command>"   keep that agent turning on its own
 collab-cue ring       --as me --expect R-1,R-2 [--final]
                       warns on stderr if your latest entry bolds ids (`**R-3**`) that --expect omits
 collab-cue status     --as me [--json]   do I owe a round? (run this every turn)
@@ -41,8 +42,20 @@ every fifth round). To ask, an agent runs `ring --kind human --note "<what it ne
 agent's `next` then says `standby`. When the collaboration is closed, `next` says `closed` and the
 agent asks the human whether to continue; reopening is the human's call.
 
-Agents cannot wake themselves: something has to start each turn (you, a scheduler, or a background
-`collab-cue wait`).
+Agents cannot wake themselves: something has to start each turn. Either use a background
+`collab-cue wait` where the agent's harness wakes on a finished background command, or run a
+watcher per agent:
+
+```
+collab-cue watch --as alice --exec 'claude -p "Run collab-cue next --as alice and do what it says"'
+```
+
+`watch` waits for the other side to ring, runs `--exec` (from the project root, with `COLLAB_AS` and
+`COLLAB_NEXT` set) whenever a round or answer is owed, then waits again. It stops, leaving the
+restart to you, when the agent asks the human or the collaboration closes (exit 0), when a run makes
+no progress or `--max-runs` (default 10) is reached (exit 1), when `--exec` fails (exit 2), or on
+`--timeout` (default 3600 s, exit 3). Give the `--exec` command the same permissions you would give
+that agent in a normal session, and no more. Run one watcher per agent name.
 
 `--as` can also come from the `COLLAB_AS` environment variable. It is not stored in `collab/`,
 because both agents share that folder.
