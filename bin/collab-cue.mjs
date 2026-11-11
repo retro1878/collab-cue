@@ -59,6 +59,8 @@ const CMDS = {
   ring: [['as', 'kind', 'note', 'expect'], ['final']],
   status: [['as'], ['json']],
   wait: [['as', 'timeout', 'poll'], []],
+  next: [['as'], []],
+  brief: [['as'], []],
   gate: [['as', 'ids'], []],
   ack: [['as'], []],
   commit: [['as'], []],
@@ -252,12 +254,15 @@ const parseIds = (s) => (s ? String(s).split(',').map((x) => x.trim()).filter(Bo
 
 /* ------------------------------------------------------------------ commands */
 
+const isClosed = (text) => text.lastIndexOf('\n## COLLAB CLOSED') > text.lastIndexOf('\n## COLLAB REOPENED');
+
 function cmdInit({ root, report }) {
   const p = paths(root, report);
   fs.mkdirSync(p.dir, { recursive: true });
   if (!fs.existsSync(p.report)) fs.writeFileSync(p.report, '# Collaboration report\n\n## Log\n', 'utf8');
   if (!fs.existsSync(p.cue)) writeJson(p.cue, { protocol: PROTOCOL, seq: 0, from: null, sha: null, at: null, final: false, expect: [] });
   io.out(`initialised ${p.dir} (protocol ${PROTOCOL})\n`);
+  io.out(`next: give each agent its instructions, one per agent name:\n  collab-cue brief --as <name>\n`);
 }
 
 /** Bolded ids (`**R-3**`) that start a row or bullet in the ringer's own latest turn. Used only to
@@ -274,6 +279,7 @@ function boldedIds(text, as) {
 
 function cmdRing({ root, report, as, kind = 'notes', note = '', expect, final }) {
   needAs(as);
+  if (kind === 'human' && !note) die('--kind human needs --note: say in one line what you need from the human');
   const p = paths(root, report);
   const prev = readJson(p.cue, {});
   const { text, sha } = readReport(p);
@@ -339,9 +345,8 @@ function cmdWait({ root, report, as, timeout = '3600', poll = '15' }) {
   }
 }
 
-function cmdGate({ root, report, as, ids }) {
-  needAs(as);
-  const p = paths(root, report);
+/** Everything the gate decides, as data: shared by `gate` (prints it) and `next` (acts on it). */
+function gateState(p, as, ids) {
   const { text, sha } = readReport(p);
   const age = Math.round((Date.now() - fs.statSync(p.report).mtimeMs) / 1000);
   const state = readJson(p.state(as), { lastReviewedSha: null });
@@ -361,8 +366,70 @@ function cmdGate({ root, report, as, ids }) {
   const settled = finalByWriter || age >= SETTLE_SECONDS;
   const ready = fresh && settled && hasEntries && notMe && missing.length === 0;
   const reason = !fresh ? 'no-new-content' : !settled ? 'still-changing' : !hasEntries ? 'no-entries' : !notMe ? 'waiting-for-counterpart' : missing.length ? 'answers-incomplete' : 'ready';
-  io.out(`STATE ready=${ready ? 'yes' : 'no'} new=${fresh ? 'yes' : 'no'} settled=${settled ? 'yes' : 'no'} age=${age}s lastAuthor=${author} reason=${reason} missing=${missing.length ? missing.join(',') : 'none'}\n`);
-  throw new Exit(ready ? 0 : 1);
+  return { cue, age, author, fresh, settled, missing, ready, reason };
+}
+
+function cmdGate({ root, report, as, ids }) {
+  needAs(as);
+  const g = gateState(paths(root, report), as, ids);
+  io.out(`STATE ready=${g.ready ? 'yes' : 'no'} new=${g.fresh ? 'yes' : 'no'} settled=${g.settled ? 'yes' : 'no'} age=${g.age}s lastAuthor=${g.author} reason=${g.reason} missing=${g.missing.length ? g.missing.join(',') : 'none'}\n`);
+  throw new Exit(g.ready ? 0 : 1);
+}
+
+/** One line that says what to do this turn, so an agent needs no judgement to pick the next step. */
+function cmdNext({ root, report, as }) {
+  needAs(as);
+  const p = paths(root, report);
+  const say = (action, detail, advice) => io.out(`NEXT ${action}${detail ? ` ${detail}` : ''} - ${advice}\n`);
+  if (isClosed(readReport(p).text)) {
+    return say('closed', '', 'the collaboration is closed. Ask the human whether to continue with the remaining tasks; do not reopen on your own');
+  }
+  const { cue, rung } = cueState(p, as);
+  const note = JSON.stringify(cue?.note ?? '');
+  if (cue?.kind === 'human' && cue.from === as) return say('human', `note=${note}`, 'you asked the human for something. Stop until they reply, then ring normally');
+  if (rung && cue.kind === 'human') return say('standby', `from=${cue.from} note=${note}`, `${cue.from} is waiting on the human. Do not start a round`);
+  if (!rung) return say('wait', '', 'nothing is owed to the other agent. Stop, or run `wait` as a background job');
+  const g = gateState(p, as);
+  if (g.reason === 'still-changing') return say('settling', `age=${g.age}s`, 'the other agent may still be writing. Check again shortly; do not read it yet');
+  if (g.reason === 'answers-incomplete') return say('answer', `from=${cue.from} missing=${g.missing.join(',')}`, 'answer only the missing ids in your next entry');
+  if (g.ready) return say('round', `from=${cue.from} expect=${(cue.expect ?? []).join(',') || '-'}`, 'review the other agent\'s latest entry (`tail`), answer every id, then append, commit, ack, ring');
+  return say('wait', `reason=${g.reason}`, 'nothing for you to review yet');
+}
+
+/** The instructions an agent needs, with its name filled in. Paste into that agent's prompt. */
+function cmdBrief({ report, as }) {
+  needAs(as);
+  const file = path.basename(report ?? 'PROJECT_REPORT.md');
+  const c = (cmd) => `collab-cue ${cmd} --as ${as}`;
+  io.out([
+    `You are "${as}" in a two-agent review with another agent. The shared file is ${file}.`,
+    'Run these from the project root. Never edit the file by hand or touch the other agent\'s entries.',
+    '',
+    `Start every turn, and after every step, with:  ${c('next')}`,
+    'It prints one line, NEXT <action>. Do what it says:',
+    `  round     Read the other agent's latest entry (${c('tail')}). Answer every finding on`,
+    '            its own line as ACCEPT, REBUT or DEFER, with evidence. Then, in order:',
+    `              ${c('append')}   (entry on stdin; first line "### ${as} - title", "####" below it)`,
+    `              ${c('commit')}   (prints the round number)`,
+    `              ${c('ack')}`,
+    `              collab-cue ring --as ${as} --expect <ids you answered> --final`,
+    '  answer    As round, but answer only the missing ids it lists.',
+    '  settling  The other agent is still writing. Re-check shortly; do not read yet.',
+    `  wait      Nothing is owed. Stop, or run ${c('wait')} (exit 3 = timeout, then stop).`,
+    '  standby   The other agent is waiting on the human. Do nothing.',
+    '  human     You asked the human something. Stop until they reply.',
+    '  closed    The collaboration is closed. Ask the human whether to continue with the',
+    '            remaining tasks. Never reopen on your own.',
+    '',
+    'Work autonomously: do not ask the human whether to proceed with a round. Stop and ask the human only when you need one of:',
+    '  - a decision only they can make, or a credential or secret;',
+    '  - anything destructive or outward-facing (publishing, sending, deleting, spending);',
+    '  - confirmation to continue, when you have no open findings left, or when the round',
+    '    number printed by commit is a multiple of 5.',
+    'To ask: run  collab-cue ring --as ' + as + ' --kind human --note "<one line: what you need>",',
+    'tell the human the same line, and stop. Do not guess at the answer.',
+    '',
+  ].join('\n'));
 }
 
 function cmdAck({ root, report, as }) {
@@ -443,7 +510,7 @@ function cmdClose({ root, report, as, open }) {
   const p = paths(root, report);
   const cue = readJson(p.cue, { expect: [] });
   const { text } = readReport(p);
-  if (text.lastIndexOf('\n## COLLAB CLOSED') > text.lastIndexOf('\n## COLLAB REOPENED')) refuse('refusing to close: already closed (append `## COLLAB REOPENED` first)');
+  if (isClosed(text)) refuse('refusing to close: already closed (append `## COLLAB REOPENED` first)');
   const missing = missingAnswers(text, cue.expect ?? [], cue.from ? (h) => isMine(h, cue.from) : () => true);
   if (missing.length) refuse(`refusing to close: expected id(s) not answered: ${missing.join(',')} (G-16)`);
   const block = ['', '## COLLAB CLOSED', '', `- Closed by: ${as}`, `- Open findings: ${open}`, `- At: ${new Date().toISOString()}`, ''].join('\n');
@@ -547,6 +614,37 @@ a${String.fromCharCode(code)}b
     run(['ring', '--as', 'dsh', '--expect', 'R-1']);
     t('a re-ring for the same bytes is rung again (F4)', /state=rung .*expect=R-1/.test(run(['status', '--as', 'amy']).out));
 
+    /* --as fallback, brief, init hint */
+    fresh();
+    t('init points at brief', /brief --as/.test(run(['init']).out));
+    t('brief fills in the name and the loop', (() => { const r = run(['brief', '--as', 'dsh']); return r.code === 0 && /You are "dsh"/.test(r.out) && /collab-cue next --as dsh/.test(r.out) && /### dsh - title/.test(r.out) && /--kind human/.test(r.out); })());
+    t('brief needs --as', run(['brief']).code === 2);
+    process.env.COLLAB_AS = 'envy';
+    t('COLLAB_AS is the default for --as', /as=envy/.test(run(['status']).out));
+    t('--as beats COLLAB_AS', /as=amy/.test(run(['status', '--as', 'amy']).out));
+    delete process.env.COLLAB_AS;
+
+    /* next */
+    fresh();
+    const nx = (n) => run(['next', '--as', n]).out;
+    t('next: wait when nothing rang', /^NEXT wait /.test(nx('amy')));
+    app('dsh', '### DSH - r\n| R-1 | ACCEPT | a |\n');
+    run(['ring', '--as', 'dsh', '--expect', 'R-1']);
+    t('next: settling while the writer has not finished', /^NEXT settling /.test(nx('amy')));
+    run(['ring', '--as', 'dsh', '--expect', 'R-1', '--final']);
+    t('next: round when ready', /^NEXT round from=dsh expect=R-1 /.test(nx('amy')));
+    run(['ring', '--as', 'dsh', '--expect', 'R-1,R-2', '--final']);
+    t('next: answer lists only the missing ids', /^NEXT answer from=dsh missing=R-2 /.test(nx('amy')));
+    t('ring --kind human needs --note', run(['ring', '--as', 'dsh', '--kind', 'human']).code === 2);
+    run(['ring', '--as', 'dsh', '--kind', 'human', '--note', 'need the prod key']);
+    t('next: the asker is told to stop', /^NEXT human note="need the prod key"/.test(nx('dsh')));
+    t('next: the other agent stands by', /^NEXT standby from=dsh /.test(nx('amy')));
+    run(['ring', '--as', 'dsh', '--expect', 'R-1', '--final']);
+    run(['ack', '--as', 'amy']);
+    t('next: wait after ack', /^NEXT wait /.test(nx('amy')));
+    run(['ring', '--as', 'dsh', '--expect', 'R-1', '--final']);
+    t('next: closed asks the human', (() => { run(['close', '--as', 'dsh', '--open', '0']); return /^NEXT closed /.test(nx('amy')) && /human/.test(nx('amy')); })());
+
     /* ring warns about bolded ids missing from --expect (G-14) */
     fresh();
     app('dsh', '### DSH - r\n| **R-1** | ACCEPT | a |\n| **R-2** | REBUT | b |\n- **P-3** DEFER\nprose about **R-9** here\n');
@@ -631,18 +729,20 @@ a${String.fromCharCode(code)}b
 
 /* ------------------------------------------------------------------ main */
 
-const USAGE = 'collab-cue <init|ring|status|wait|gate|ack|commit|append|tail|close|selftest> [--root dir] [--report file] [--as agent] [--expect ids] [--final] [--json] [--file path] [--open n] [--ids ids] [--timeout s] [--poll s]\n';
+const USAGE = 'collab-cue <init|brief|ring|status|next|wait|gate|ack|commit|append|tail|close|selftest> [--root dir] [--report file] [--as agent] [--expect ids] [--final] [--json] [--file path] [--open n] [--ids ids] [--timeout s] [--poll s]\n';
 
 function dispatch(argv) {
   const cmd = argv[0];
   if (!cmd) { io.out(USAGE); throw new Exit(0); }
   if (!Object.hasOwn(CMDS, cmd)) { io.out(USAGE); throw new Exit(1); }
   const f = parseFlags(cmd, argv.slice(1));
-  const a = { root: f.root ?? process.cwd(), report: f.report, as: f.as };
+  const a = { root: f.root ?? process.cwd(), report: f.report, as: f.as || process.env.COLLAB_AS || undefined };
   switch (cmd) {
     case 'init': return cmdInit(a);
     case 'ring': return cmdRing({ ...a, kind: f.kind, note: f.note, expect: f.expect, final: f.final });
     case 'status': return cmdStatus({ ...a, json: f.json });
+    case 'next': return cmdNext(a);
+    case 'brief': return cmdBrief(a);
     case 'wait': return cmdWait({ ...a, timeout: f.timeout, poll: f.poll });
     case 'gate': return cmdGate({ ...a, ids: f.ids });
     case 'ack': return cmdAck(a);

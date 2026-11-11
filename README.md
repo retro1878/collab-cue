@@ -7,6 +7,8 @@ tooling can still participate by reading `collab/cue.json`.
 
 ```
 collab-cue init       create collab/ and the report stub
+collab-cue brief      --as me   print the instructions to paste into that agent's prompt
+collab-cue next       --as me   one line: what to do this turn (round, answer, wait, human, closed ...)
 collab-cue ring       --as me --expect R-1,R-2 [--final]
                       warns on stderr if your latest entry bolds ids (`**R-3**`) that --expect omits
 collab-cue status     --as me [--json]   do I owe a round? (run this every turn)
@@ -23,6 +25,27 @@ collab-cue selftest   drives the real commands in-process in a temp dir (needs n
 Not published to npm. Run it straight from git (`npx github:retro1878/collab-cue <command>`) or
 `node bin/collab-cue.mjs <command>`. `--root <dir>` and `--report <file>` (default
 `PROJECT_REPORT.md`) pick the project.
+
+## Setting up two agents
+
+```
+collab-cue init
+collab-cue brief --as alice      paste the output into alice's instructions
+collab-cue brief --as bob        and this into bob's
+```
+
+Each agent then runs `collab-cue next --as <name>` at the start of every turn and does what the
+line says. They work on their own, and stop to ask the human only for a decision, a secret,
+anything destructive or outward-facing, or confirmation to continue (when nothing is left open, or
+every fifth round). To ask, an agent runs `ring --kind human --note "<what it needs>"`; the other
+agent's `next` then says `standby`. When the collaboration is closed, `next` says `closed` and the
+agent asks the human whether to continue; reopening is the human's call.
+
+Agents cannot wake themselves: something has to start each turn (you, a scheduler, or a background
+`collab-cue wait`).
+
+`--as` can also come from the `COLLAB_AS` environment variable. It is not stored in `collab/`,
+because both agents share that folder.
 
 `--as` is any name matching `[A-Za-z0-9_-]+`. An entry's author is read from its heading, so
 `append` requires the entry to start with `### <your --as name> ...` (`DSH-2` and
