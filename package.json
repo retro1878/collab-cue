@@ -1,10 +1,19 @@
 {
   "name": "collab-cue",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cue-based review protocol for two agents sharing one file. Zero dependencies.",
   "type": "module",
-  "private": true,
   "bin": { "collab-cue": "bin/collab-cue.mjs" },
+  "files": ["bin", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node bin/collab-cue.mjs selftest",
+    "prepublishOnly": "node bin/collab-cue.mjs selftest"
+  },
   "engines": { "node": ">=20" },
-  "license": "MIT"
+  "license": "MIT",
+  "keywords": ["agents", "ai-agents", "review", "protocol", "cli", "collaboration"],
+  "repository": { "type": "git", "url": "git+https://github.com/retro1878/collab-cue.git" },
+  "bugs": { "url": "https://github.com/retro1878/collab-cue/issues" },
+  "homepage": "https://github.com/retro1878/collab-cue#readme",
+  "publishConfig": { "access": "public" }
 }
