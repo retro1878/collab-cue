@@ -13,7 +13,8 @@
  *   G-15  zero dependencies, runnable as `node bin/collab-cue.mjs`, npm later.
  *   G-16  close refuses while anything is open; there is no --force.
  *
- * Exit codes: 0 ok · 1 blocked (gate not ready, a guard refused) · 2 error (bad usage, bad files).
+ * Exit codes: 0 ok · 1 blocked (gate not ready, a guard refused) · 2 error (bad usage, bad files)
+ *             · 3 timeout (`wait` ran out of time with nothing rung).
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -57,6 +58,7 @@ const CMDS = {
   init: [[], []],
   ring: [['as', 'kind', 'note', 'expect'], ['final']],
   status: [['as'], ['json']],
+  wait: [['as', 'timeout', 'poll'], []],
   gate: [['as', 'ids'], []],
   ack: [['as'], []],
   commit: [['as'], []],
@@ -277,17 +279,48 @@ function cmdRing({ root, report, as, kind = 'notes', note = '', expect, final })
   io.out(`rung by ${as} (${cue.expect.length} expected id(s)${cue.final ? ', final' : ''})\n`);
 }
 
-function cmdStatus({ root, report, as, json }) {
-  needAs(as);
-  const p = paths(root, report);
+/** The cue as `as` sees it: rung when the counterpart rang and `as` has not acked that ring. */
+function cueState(p, as) {
   const cue = readJson(p.cue);
   const ack = readJson(p.ack(as), { sha: null, seq: 0 });
   const unseen = cue && (cue.sha !== ack.sha || (cue.seq ?? 0) > (ack.seq ?? 0));
-  const rung = Boolean(cue && cue.from && cue.from !== as && unseen);
+  return { cue, rung: Boolean(cue && cue.from && cue.from !== as && unseen) };
+}
+
+function cmdStatus({ root, report, as, json }) {
+  needAs(as);
+  const p = paths(root, report);
+  const { cue, rung } = cueState(p, as);
   if (json) {
     io.out(JSON.stringify({ as, state: rung ? 'rung' : 'quiet', from: cue?.from ?? null, sha: cue?.sha ?? null, seq: cue?.seq ?? 0, expect: cue?.expect ?? [] }) + '\n');
   } else {
     io.out(`CUE as=${as} state=${rung ? 'rung' : 'quiet'} from=${cue?.from ?? '-'} expect=${(cue?.expect ?? []).join(',') || '-'}\n`);
+  }
+}
+
+/** Block until the counterpart rings, or time out (exit 3). A convenience, never the mechanism:
+ *  `status` answers whenever asked and cannot time out, so a dead waiter loses nothing. Does not
+ *  ack; after your round, `ack` then `ring`. */
+function cmdWait({ root, report, as, timeout = '3600', poll = '15' }) {
+  needAs(as);
+  const t = Number(timeout);
+  const every = Number(poll);
+  if (!Number.isFinite(t) || t < 0) die(`--timeout must be a number of seconds >= 0 (got '${timeout}')`);
+  if (!Number.isFinite(every) || every <= 0) die(`--poll must be a number of seconds > 0 (got '${poll}')`);
+  const p = paths(root, report);
+  const deadline = Date.now() + t * 1000;
+  for (;;) {
+    const { cue, rung } = cueState(p, as);
+    if (rung) {
+      io.out(`CUE rung from=${cue.from} note=${JSON.stringify(cue.note ?? '')} sha=${cue.sha} seq=${cue.seq ?? 0} expect=${(cue.expect ?? []).join(',') || '-'}\n`);
+      return;
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) {
+      io.out(`CUE timeout as=${as} after=${t}s\n`);
+      throw new Exit(3);
+    }
+    sleep(Math.min(every * 1000, left));
   }
 }
 
@@ -499,6 +532,18 @@ a${String.fromCharCode(code)}b
     run(['ring', '--as', 'dsh', '--expect', 'R-1']);
     t('a re-ring for the same bytes is rung again (F4)', /state=rung .*expect=R-1/.test(run(['status', '--as', 'amy']).out));
 
+    /* wait (exit 3) */
+    fresh();
+    app('dsh', '### DSH - r\nx\n');
+    t('wait times out with exit 3 when nothing rings', (() => { const r = run(['wait', '--as', 'amy', '--timeout', '0.3', '--poll', '0.1']); return r.code === 3 && /CUE timeout/.test(r.out); })());
+    run(['ring', '--as', 'dsh', '--note', 'R-1 answered', '--expect', 'R-1']);
+    t('wait returns at once when already rung', (() => { const r = run(['wait', '--as', 'amy', '--timeout', '5']); return r.code === 0 && /CUE rung from=dsh note="R-1 answered"/.test(r.out) && /expect=R-1/.test(r.out); })());
+    t('wait does not ack', /state=rung/.test(run(['status', '--as', 'amy']).out));
+    run(['ack', '--as', 'amy']);
+    t('wait times out again after ack', run(['wait', '--as', 'amy', '--timeout', '0', '--poll', '0.1']).code === 3);
+    t('wait never rings for your own cue', run(['wait', '--as', 'dsh', '--timeout', '0']).code === 3);
+    t('wait rejects a bad --timeout / --poll', run(['wait', '--as', 'amy', '--timeout', 'x']).code === 2 && run(['wait', '--as', 'amy', '--poll', '0']).code === 2);
+
     /* gate */
     fresh();
     const old = new Date(Date.now() - 400000);
@@ -561,7 +606,7 @@ a${String.fromCharCode(code)}b
 
 /* ------------------------------------------------------------------ main */
 
-const USAGE = 'collab-cue <init|ring|status|gate|ack|commit|append|tail|close|selftest> [--root dir] [--report file] [--as agent] [--expect ids] [--final] [--json] [--file path] [--open n] [--ids ids]\n';
+const USAGE = 'collab-cue <init|ring|status|wait|gate|ack|commit|append|tail|close|selftest> [--root dir] [--report file] [--as agent] [--expect ids] [--final] [--json] [--file path] [--open n] [--ids ids] [--timeout s] [--poll s]\n';
 
 function dispatch(argv) {
   const cmd = argv[0];
@@ -573,6 +618,7 @@ function dispatch(argv) {
     case 'init': return cmdInit(a);
     case 'ring': return cmdRing({ ...a, kind: f.kind, note: f.note, expect: f.expect, final: f.final });
     case 'status': return cmdStatus({ ...a, json: f.json });
+    case 'wait': return cmdWait({ ...a, timeout: f.timeout, poll: f.poll });
     case 'gate': return cmdGate({ ...a, ids: f.ids });
     case 'ack': return cmdAck(a);
     case 'commit': return cmdCommit(a);
