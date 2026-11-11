@@ -23,6 +23,11 @@ be un-bluffable. F1 and F2 should block; F3–F4 are cheap and belong in this PR
 | F7 | Low | The *reviewer* can retire the writer's settle window by ringing `--final` | `:193-195` |
 | F8 | Low / env | `selftest` cannot run inside a confined agent sandbox (piped stdio → `EPERM`) | `:299-302` |
 | n1–n4 | Nit | control-byte message hardcodes `(R-41)`; `close` not idempotent; `append` silently creates a missing report; bare `--file` reads stdin | `:240`, `:278-287`, `:248` |
+| F9 | **High** | `missingAnswers` scans the entire report instead of the counterpart's latest entry — old answers or finding definitions mentioning `ACCEPT`/`REBUT`/`DEFER` silently satisfy new `--expect` | `:128-134`, `:188`, `:276` |
+| F10 | **High** | `append` scans every line for `/^###\s/` without ignoring fenced code blocks (` ``` ` / `~~~`) — markdown examples or shell comments (`###`) cause valid entries to be refused | `:243-246`, `:104-111`, `:258-263` |
+| F11 | Medium | `tail` slices from the last non-`as` heading (`if (m && !isMine) start = i`), dropping earlier entries when the counterpart writes ≥2 consecutive entries (e.g., entry + `### Correction (DSH)`) | `:255-265` |
+| F12 | Medium | F3's proposed `firstToken` fix breaks `HOOK.md §2.3` correction blocks (`### Correction (DSH) — ...`), where the first token is `correction`, not the agent name | `:114-121`, `REVIEW-PR1.md:105-108` |
+| F13 | Low | `status` checks `if (json)` directly instead of `flag(json)`, so `--json false` or `--json 0` still outputs JSON; `writeJson` uses a shared `pid` temp path | `:173`, `:82` |
 
 ## What I verified as fixed `[E-1]`
 
@@ -228,9 +233,73 @@ Every evidence tag in this document points at a command that was run, not at a r
 | E-7 | F6 | `init`, backdate report 400 s, `gate --as amy` | `ready=yes lastAuthor=unknown` |
 | E-8 | F7 | append half an entry as `dsh`, `gate --as amy`, `ring --as amy --final`, `gate --as amy` | `still-changing` → `ready` at age 3 s |
 | E-9 | F8 | `spawnSync` with default stdio under the file sandbox | `{"status":null,"error":"EPERM"}`; selftest died on uncaught `ENOENT` |
+| E-10 | F9 | `append` finding row `\| **R-20** \| H \| Gate must not ACCEPT bad input \| Fix it \|` as `dsh`, then `append` entry without answering `R-20` as `antigravity`, `gate --as dsh --ids R-20` | `STATE ready=yes ... missing=none` (`exit=0`) |
+| E-11 | F10 | `append --as dsh` with `### DSH - round 1` + fenced ```` ```sh \n ### comment in bash \n ``` ```` | `refusing to append: 1 extra '###' heading(s) inside the entry` (`exit=1`) |
+| E-12 | F11 | `append` two consecutive entries as `zed` (`round 1` and `round 2`), then `tail --as dsh` | printed only `### Zed - round 2`, dropping `round 1` |
+| E-13 | F12 | `append --as dsh '### Correction (DSH) — 2026-11-11'`, then `gate --as antigravity` | `lastAuthor=correction`; under F3's `firstToken(h) === as`, `isMine` would also become `false` for `dsh` |
+| E-14 | F13 | `status --as dsh --json false` | printed JSON `{"as":"dsh","state":"rung",...}` instead of text line |
 
 Environment: Windows, Node v26.7.0, PowerShell 7. Temp roots are discarded per probe; no probe wrote
 outside its own `--root` except the read-only downloads of the base and head blobs.
 
 The `bin/collab-cue.mjs` line numbers above are from the PR head (`595f65e`), not from `master`.
+
+---
+
+## Addendum — Deep-Dive Review (Antigravity)
+
+Reviewed the full repository history (`3240b92` → `1993bc2`, PR #1 `9e4370a` → `595f65e`, and `review/pr1` `377b7f7`) alongside the origin session in `termix-reverse-ssh` (`PROJECT_REPORT.md` Rounds 1–19, `collab/HOOK.md`, `collab/LESSONS.md`, `collab/check_state.ps1`, `collab/cue.ps1`).
+
+### Summary of Additional Findings (F9–F13)
+
+#### F9 (High) — `missingAnswers` scans the entire historical report instead of the counterpart's latest turn (`[E-10]`)
+
+`missingAnswers(text, want)` (`:128-134`, called at `:188` and `:276`) splits the entire `PROJECT_REPORT.md` from line 1 and checks whether *any* line in the file starts with `<id>` and contains `ACCEPT|REBUT|DEFER` after it. This breaks the gate in two ways:
+1. **Self-answering finding definitions:** In `PROJECT_REPORT.md`, findings are introduced in Markdown tables (`| **R-20** | H | ... | ... |`). If the finding description or required action column mentions `ACCEPT`, `REBUT`, or `DEFER` in upper case (for example, `| **R-20** | H | Gate must not ACCEPT bad input | Fix it |`, which actually happened in `L-02` of the origin session!), `trimStart(line)` starts with `R-20` and `VERDICT.test(line.slice(id.length))` is `true`. The finding is marked as answered by the very table row that raised it, before the counterpart writes a single word (`[E-10]`).
+2. **Re-opened or previously deferred IDs:** If `R-10` was answered with `DEFER` in Round 1 and re-expected in Round 5 (`ring --expect R-10`), the Round 1 row permanently satisfies `missingAnswers` for the rest of the file's life.
+
+**Fix:** Scope `missingAnswers` to the counterpart's entries written *after* the requester's last `###` entry (or after the byte offset / entry corresponding to `state.<as>.lastReviewedSha`). Additionally, in table rows (`| ID | col2 | ...`), require the verdict token to be the **second cell** (`^\|\s*\*?\*?ID\*?\*?\s*\|\s*(ACCEPT|REBUT|DEFER)\b`) rather than matching anywhere in the row's prose.
+
+#### F10 (High) — `append`, `lastHeading`, and `tail` do not ignore fenced code blocks (`[E-11]`)
+
+In `cmdAppend` (`:243-246`), `lastHeading` (`:104-111`), and `cmdTail` (`:258-263`), every line matching `/^###\s/` is treated as an entry heading. Markdown fenced code blocks (` ``` ` or `~~~`) are not tracked.
+- In `PROJECT_REPORT.md` (lines 231, 395), entries routinely include fenced Markdown templates (`### <Your agent name> — ...`) or shell/Python snippets with `###` comments.
+- Passing such an entry to `collab-cue append` fails with `refusing to append: 1 extra '###' heading(s) inside the entry` (`[E-11]`).
+- Worse, if a report already contains a fenced `###` block, `lastHeading` and `tail` misidentify it as an entry header.
+
+**Fix:** Use a 6-line helper to strip or skip lines inside fenced code blocks (`/^(```|~~~)/`) when scanning for `### ` headings in `append`, `lastHeading`, and `tail`.
+
+#### F11 (Medium) — `tail` drops earlier entries when the counterpart writes more than one entry in a row (`[E-12]`)
+
+`README.md` (`:15`) documents `tail` as: *"everything since the counterpart's last entry"*, and the `G-13` design spec (`PROJECT_REPORT.md:1802`) defined `tail` as: *"prints only entries since `lastReviewedSha`"*.
+However, `cmdTail` (`:259-263`) does:
+```js
+let start = 0;
+lines.forEach((line, i) => {
+  const m = /^###\s+(.+)$/.exec(line);
+  if (m && !isMine(m[1], as)) start = i;
+});
+```
+Because `start` is overwritten on *every* heading that is not `as`:
+1. In `PROJECT_REPORT.md`, DSH frequently appended a main entry followed immediately by `### Correction (DSH)` (lines 521, 574, 774) or two consecutive entries (lines 588 & 613, 1298 & 1323, 1704 & 1727 & 1748). Running `tail --as antigravity` overwrites `start` at the last one and **drops all preceding unread entries from the counterpart** (`[E-12]`).
+2. Conversely, if `as` has already replied at the bottom of the file, `tail --as me` still prints the counterpart's old entry AND `me`'s own latest entry after it.
+
+**Fix:** Slice from the first non-`as` entry *after* the last `as` entry (or, if `state.<as>.json` exists, from the first entry after `lastReviewedSha`).
+
+#### F12 (Medium) — F3's proposed `firstToken` fix breaks `HOOK.md` correction headings (`[E-13]`)
+
+`HOOK.md §2.3` and `check_state.ps1:96` (`author-correction-block`) explicitly mandate `### Correction (DSH) — YYYY-MM-DD` for corrections.
+- On PR #1 head, `isMine("Correction (DSH) — ...", "dsh")` is `true` (because `DSH` appears inside parens), while `authorOf` (`:120`) returns `correction` when queried by `antigravity` (`[E-13]`).
+- If F3's recommendation (`firstToken(h) === as.toLowerCase()`) is applied verbatim, `firstToken("Correction (DSH)...")` is `"correction"`, which breaks `isMine` for `### Correction (<agent>)` blocks—regressing the `check_state.ps1:96` selftest fixture (`L-11`).
+
+**Fix for both F3 and F12:** Strip a leading `Correction\s*` prefix (or parenthesized tag) before extracting the agent token, or require `cmdAppend` to format headings canonically as `### <as> — ...` (and `### <as> (Correction) — ...`) so the agent identifier is always the first token `[A-Za-z0-9_-]+` after `### `.
+
+#### F13 (Low) — `status --json false` outputs JSON, and `writeJson` temp path is shared per PID (`[E-14]`)
+
+1. PR #1 added `const flag = (v) => ...` (`:47`) to fix `--final false`, and applied it in `cmdRing` (`:160`), but forgot to apply it in `cmdStatus` (`:173`), which still tests `if (json)` directly. Thus `collab-cue status --as dsh --json false` outputs JSON (`[E-14]`).
+2. `writeJson` (`:82`) writes to `${file}.${process.pid}.tmp` and `fs.renameSync`s it. That is atomic on POSIX and on Node/Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, though Windows AV/indexers holding a brief read handle on `cue.json` can transiently fail `renameSync` with `EPERM`/`EACCES` (which is why `cue.ps1:31` had a 5-try retry loop).
+
+### Assessment of F8 (Sandbox `spawnSync` `EPERM`)
+
+In the Antigravity harness on this machine, `node bin/collab-cue.mjs selftest` runs and passes all 28 cases (`SELFTEST RESULT pass`), whereas in the Claude Code confined sandbox (`_pr-review/probe-spawn.mjs`) child process creation with piped stdio is blocked with `EPERM`. Adding an in-process dispatch fallback when `spawnSync` returns `r.error?.code === 'EPERM'` (or refactoring `main` into a callable `runCli(argv, stdin)` function) would make `selftest` work in **both** sandboxes with zero child-process overhead and ~10× faster execution.
 
