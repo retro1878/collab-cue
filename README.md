@@ -25,9 +25,6 @@ Not published to npm. Run it straight from git (`npx github:retro1878/collab-cue
 `--as` is any name matching `[A-Za-z0-9_-]+`. An entry's author is read from its `### <name> ...`
 heading, so use your `--as` name in it.
 
-```
-```
-
 ## Why it exists
 
 Built from a collaboration that lost two rounds to the same three defects: an entry inserted
