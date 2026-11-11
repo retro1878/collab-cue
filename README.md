@@ -23,8 +23,8 @@ collab-cue close      --as me --open 0   refuses unless --open is 0 and the ring
 collab-cue selftest   drives the real commands in-process in a temp dir (needs no child processes)
 ```
 
-Not published to npm. Run it straight from git (`npx github:retro1878/collab-cue <command>`) or
-`node bin/collab-cue.mjs <command>`. `--root <dir>` and `--report <file>` (default
+Install: `npm i -g collab-cue`, or run without installing: `npx collab-cue <command>`. From a
+clone, `node bin/collab-cue.mjs <command>` works too. `--root <dir>` and `--report <file>` (default
 `PROJECT_REPORT.md`) pick the project.
 
 ## Setting up two agents
