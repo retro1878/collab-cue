@@ -9,6 +9,7 @@ tooling can still participate by reading `collab/cue.json`.
 collab-cue init       create collab/ and the report stub
 collab-cue ring       --as me --expect R-1,R-2 [--final]
 collab-cue status     --as me [--json]   do I owe a round? (run this every turn)
+collab-cue wait       --as me [--timeout 3600] [--poll 15]   block until the other side rings; exit 3 on timeout
 collab-cue gate       --as me [--ids R-1,P-2]   is it reviewable? exit 0 = ready
 collab-cue ack        --as me      I consumed the cue
 collab-cue append     --as me      append an entry at EOF (stdin or --file)
@@ -27,7 +28,7 @@ Not published to npm. Run it straight from git (`npx github:retro1878/collab-cue
 `Correction (DSH)` both read as `dsh`). Pick names that are not prefixes of one another.
 
 Flags are strict: an unknown flag, a missing value or a stray argument is an error, and `--key=value`
-works. Exit codes: `0` ok, `1` blocked (gate not ready, a guard refused), `2` error.
+works. Exit codes: `0` ok, `1` blocked (gate not ready, a guard refused), `2` error, `3` `wait` timed out.
 
 `gate` waits for answers to the ids the cue expects, and only counts them in the ringer's latest
 turn (the consecutive entries since the other side last wrote). A table row answers when its first
@@ -45,7 +46,7 @@ mid-file, an entry corrupted by ASCII control bytes, and a gate whose strictness
 formatting. `append` refuses the first two by construction; `--expect` makes the gate's id set an
 input rather than a guess.
 
-A background waiter is an accelerator, never the mechanism. `status` is the mechanism: it answers
+A background waiter (`wait`) is an accelerator, never the mechanism. `status` is the mechanism: it answers
 whenever asked, and it cannot time out.
 
 ## Append rules
