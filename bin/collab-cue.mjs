@@ -260,21 +260,36 @@ function cmdInit({ root, report }) {
   io.out(`initialised ${p.dir} (protocol ${PROTOCOL})\n`);
 }
 
+/** Bolded ids (`**R-3**`) that start a row or bullet in the ringer's own latest turn. Used only to
+ *  warn: the gate's id set is the --expect input, never derived from the report (G-14). */
+function boldedIds(text, as) {
+  const lines = trailingRun(entries(text), (h) => isMine(h, as)).flatMap((e) => e.lines);
+  const found = new Set();
+  for (const line of lines) {
+    const m = /^[\s>|-]*\*\*([A-Za-z]+-\d+)\*\*/.exec(line);
+    if (m) found.add(m[1]);
+  }
+  return [...found];
+}
+
 function cmdRing({ root, report, as, kind = 'notes', note = '', expect, final }) {
   needAs(as);
   const p = paths(root, report);
   const prev = readJson(p.cue, {});
+  const { text, sha } = readReport(p);
   const cue = {
     protocol: PROTOCOL,
     seq: (prev.seq ?? 0) + 1, // a re-ring for the same bytes is still a new ring (F4)
     from: as,
     kind,
     note,
-    sha: readReport(p).sha,
+    sha,
     at: new Date().toISOString(),
     final: Boolean(final),
     expect: parseIds(expect),
   };
+  const unlisted = boldedIds(text, as).filter((id) => !cue.expect.includes(id));
+  if (unlisted.length) io.err(`collab-cue: warning: your latest entry has bolded id(s) not in --expect: ${unlisted.join(',')} (the counterpart will not be asked to answer them)\n`);
   writeJson(p.cue, cue);
   io.out(`rung by ${as} (${cue.expect.length} expected id(s)${cue.final ? ', final' : ''})\n`);
 }
@@ -531,6 +546,16 @@ a${String.fromCharCode(code)}b
     t('status is quiet after ack', /state=quiet/.test(run(['status', '--as', 'amy']).out));
     run(['ring', '--as', 'dsh', '--expect', 'R-1']);
     t('a re-ring for the same bytes is rung again (F4)', /state=rung .*expect=R-1/.test(run(['status', '--as', 'amy']).out));
+
+    /* ring warns about bolded ids missing from --expect (G-14) */
+    fresh();
+    app('dsh', '### DSH - r\n| **R-1** | ACCEPT | a |\n| **R-2** | REBUT | b |\n- **P-3** DEFER\nprose about **R-9** here\n');
+    t('ring warns about bolded ids not in --expect', (() => { const r = run(['ring', '--as', 'dsh', '--expect', 'R-1']); return r.code === 0 && /warning: .*R-2,P-3/.test(r.err) && !/R-9|R-1[^0-9]/.test(r.err.replace('--expect', '')); })());
+    t('ring is silent when every bolded id is listed', (() => { const r = run(['ring', '--as', 'dsh', '--expect', 'R-1,R-2,P-3']); return r.code === 0 && r.err === ''; })());
+    t('the warning never changes the cue', cue().expect.join() === 'R-1,R-2,P-3');
+    t('ring warns when --expect is omitted', /R-1,R-2,P-3/.test(run(['ring', '--as', 'dsh']).err));
+    app('amy', '### Amy - r\n| **R-7** | ACCEPT | a |\n');
+    t('only the ringer\'s own latest turn is scanned', run(['ring', '--as', 'dsh', '--expect', 'R-1']).err === '');
 
     /* wait (exit 3) */
     fresh();

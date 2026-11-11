@@ -8,6 +8,7 @@ tooling can still participate by reading `collab/cue.json`.
 ```
 collab-cue init       create collab/ and the report stub
 collab-cue ring       --as me --expect R-1,R-2 [--final]
+                      warns on stderr if your latest entry bolds ids (`**R-3**`) that --expect omits
 collab-cue status     --as me [--json]   do I owe a round? (run this every turn)
 collab-cue wait       --as me [--timeout 3600] [--poll 15]   block until the other side rings; exit 3 on timeout
 collab-cue gate       --as me [--ids R-1,P-2]   is it reviewable? exit 0 = ready
