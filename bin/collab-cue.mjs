@@ -258,7 +258,8 @@ function missingAnswers(text, ids, writer) {
   return ids.filter((id) => !isAnswered(lines, id));
 }
 
-const parseIds = (s) => (s ? String(s).split(',').map((x) => x.trim()).filter(Boolean) : []);
+/** Ids are separated by commas and/or whitespace: `R-1,R-2`, `R-1 R-2`, `"R-1, R-2"`. */
+const parseIds = (s) => (s ? String(s).split(/[,\s]+/).filter(Boolean) : []);
 
 /* ------------------------------------------------------------------ commands */
 
@@ -273,14 +274,15 @@ function cmdInit({ root, report }) {
   io.out(`next: give each agent its instructions, one per agent name:\n  collab-cue brief --as <name>\n`);
 }
 
-/** Bolded ids (`**R-3**`) that start a row or bullet in the ringer's own latest turn. Used only to
- *  warn: the gate's id set is the --expect input, never derived from the report (G-14). */
+/** Bolded ids (`**R-3**`) that start an *answer* (a row or bullet carrying a verdict) in the ringer's
+ *  own latest turn. Newly raised findings are bolded too but are not answers, so they never warn.
+ *  Used only to warn: the gate's id set is the --expect input, never derived from the report (G-14). */
 function boldedIds(text, as) {
   const lines = trailingRun(entries(text), (h) => isMine(h, as)).flatMap((e) => e.lines);
   const found = new Set();
   for (const line of lines) {
     const m = /^[\s>|-]*\*\*([A-Za-z]+-\d+)\*\*/.exec(line);
-    if (m) found.add(m[1]);
+    if (m && isAnswered([line], m[1])) found.add(m[1]);
   }
   return [...found];
 }
@@ -303,7 +305,7 @@ function cmdRing({ root, report, as, kind = 'notes', note = '', expect, final })
     expect: parseIds(expect),
   };
   const unlisted = boldedIds(text, as).filter((id) => !cue.expect.includes(id));
-  if (unlisted.length) io.err(`collab-cue: warning: your latest entry has bolded id(s) not in --expect: ${unlisted.join(',')} (the counterpart will not be asked to answer them)\n`);
+  if (unlisted.length) io.err(`collab-cue: warning: your latest entry answers bolded id(s) not in --expect: ${unlisted.join(',')} (the counterpart will not be asked to answer them)\n`);
   writeJson(p.cue, cue);
   io.out(`rung by ${as} (${cue.expect.length} expected id(s)${cue.final ? ', final' : ''})\n`);
 }
@@ -462,15 +464,19 @@ function cmdBrief({ report, as }) {
   io.out([
     `You are "${as}" in a two-agent review with another agent. The shared file is ${file}.`,
     'Run these from the project root. Never edit the file by hand or touch the other agent\'s entries.',
+    'Any command takes --help.',
     '',
     `Start every turn, and after every step, with:  ${c('next')}`,
     'It prints one line, NEXT <action>. Do what it says:',
     `  round     Read the other agent's latest entry (${c('tail')}). Answer every finding on`,
-    '            its own line as ACCEPT, REBUT or DEFER, with evidence. Then, in order:',
+    '            its own line as a table row `| **ID** | VERDICT | reason |`. Then, in order:',
     `              ${c('append')}   (entry on stdin; first line "### ${as} - title", "####" below it)`,
     `              ${c('commit')}   (prints the round number)`,
     `              ${c('ack')}`,
-    `              collab-cue ring --as ${as} --expect <ids you answered> --final`,
+    `              collab-cue ring --as ${as} [--expect ID1,ID2] --final`,
+    '            --expect lists the ids your entry ANSWERED, comma-separated. If you only RAISED',
+    '            findings (answered nothing), leave --expect out. --final means "I am done writing";',
+    '            it does not end the collaboration.',
     '  answer    As round, but answer only the missing ids it lists.',
     '  settling  The other agent is still writing. Re-check shortly; do not read yet.',
     `  wait      Nothing is owed. Stop, or run ${c('wait')} (exit 3 = timeout, then stop).`,
@@ -479,8 +485,15 @@ function cmdBrief({ report, as }) {
     '  closed    The collaboration is closed. Ask the human whether to continue with the',
     '            remaining tasks. Never reopen on your own.',
     '',
+    'Verdicts (upper case, in the second cell): ACCEPT = agreed, and the change is made or planned;',
+    'REBUT = disagree, with the reason; DEFER = cannot be resolved without a decision from the human.',
+    '',
+    'Finishing: if you raised the findings and every one is now ACCEPTed (none open, none REBUT or',
+    `DEFER), run  ${c('close')} --open 0  and tell the human. close refuses while expected ids are`,
+    'unanswered. If an item is DEFER, or the two of you disagree, do not close: ask the human.',
+    '',
     'Work autonomously: do not ask the human whether to proceed with a round. Stop and ask the human only when you need one of:',
-    '  - a decision only they can make, or a credential or secret;',
+    '  - a decision only they can make (including any DEFER), or a credential or secret;',
     '  - anything destructive or outward-facing (publishing, sending, deleting, spending);',
     '  - confirmation to continue, when you have no open findings left, or when the round',
     '    number printed by commit is a multiple of 5.',
@@ -734,6 +747,17 @@ a${String.fromCharCode(code)}b
     run(['ring', '--as', 'dsh', '--expect', 'R-1', '--final']);
     t('next: closed asks the human', (() => { run(['close', '--as', 'dsh', '--open', '0']); return /^NEXT closed /.test(nx('amy')) && /human/.test(nx('amy')); })());
 
+    /* help, id separators, warning precision (found by a real two-agent run) */
+    fresh();
+    t('--help prints per-command help and exits 0', (() => { const r = run(['ring', '--help']); return r.code === 0 && /--expect lists the ids your entry ANSWERED/.test(r.out); })());
+    t('every command has help', ['init', 'brief', 'ring', 'status', 'next', 'wait', 'watch', 'gate', 'ack', 'commit', 'append', 'tail', 'close', 'selftest'].every((c) => run([c, '-h']).code === 0 && /^collab-cue /.test(run([c, '-h']).out)));
+    t('top-level --help prints usage', run(['--help']).code === 0);
+    t('--expect accepts spaces', (() => { app('dsh', '### DSH - a\n| R-1 | ACCEPT | x |\n| R-2 | ACCEPT | y |\n'); run(['ring', '--as', 'dsh', '--expect', 'R-1 R-2']); return cue().expect.join() === 'R-1,R-2'; })());
+    t('--expect accepts "R-1, R-2"', (() => { run(['ring', '--as', 'dsh', '--expect', 'R-1, R-2']); return cue().expect.join() === 'R-1,R-2'; })());
+    t('raising findings does not warn', (() => { app('dsh', '### DSH - findings\n| **F-1** | H | a problem |\n| **F-2** | M | another |\n'); return run(['ring', '--as', 'dsh']).err === ''; })());
+    t('answering without --expect still warns', (() => { app('dsh', '### DSH - answers\n| **F-1** | ACCEPT | fixed |\n'); return /answers bolded id\(s\) not in --expect: F-1/.test(run(['ring', '--as', 'dsh']).err); })());
+    t('brief explains expect, verdicts and who closes', (() => { const o = run(['brief', '--as', 'dsh']).out; return /leave --expect out/.test(o) && /DEFER = cannot be resolved/.test(o) && /close.* --open 0/.test(o) && /does not end the collaboration/.test(o); })());
+
     /* ring warns about bolded ids missing from --expect (G-14) */
     fresh();
     app('dsh', '### DSH - r\n| **R-1** | ACCEPT | a |\n| **R-2** | REBUT | b |\n- **P-3** DEFER\nprose about **R-9** here\n');
@@ -820,9 +844,27 @@ a${String.fromCharCode(code)}b
 
 const USAGE = 'collab-cue <init|brief|ring|status|next|wait|watch|gate|ack|commit|append|tail|close|selftest> [--root dir] [--report file] [--as agent] [--expect ids] [--final] [--json] [--file path] [--open n] [--ids ids] [--timeout s] [--poll s] [--exec cmd] [--max-runs n]\n';
 
+const HELP = {
+  init: 'collab-cue init [--root dir] [--report file]' + '\n' + 'Create collab/ and the report stub. Safe to re-run.',
+  brief: 'collab-cue brief --as NAME' + '\n' + 'Print the instructions to paste into that agent\'s prompt, with the name filled in.',
+  ring: 'collab-cue ring --as NAME [--expect ids] [--final] [--kind notes|human] [--note text]' + '\n' + 'Ring the bell for the other agent. --expect lists the ids your entry ANSWERED (comma or space separated);' + '\n' + 'leave it out when you only raised findings. --final: you are done writing (it does not end the collaboration).' + '\n' + '--kind human --note "<what you need>" asks the human instead of the other agent.',
+  status: 'collab-cue status --as NAME [--json]' + '\n' + 'Has the other agent rung and have I not acked? (state=rung or quiet)',
+  next: 'collab-cue next --as NAME' + '\n' + 'One line: what to do this turn (round, answer, settling, wait, standby, human, closed).',
+  wait: 'collab-cue wait --as NAME [--timeout 3600] [--poll 15]' + '\n' + 'Block until the other agent rings. Exit 0 rung, 3 timeout. Never acks.',
+  watch: 'collab-cue watch --as NAME --exec "<command>" [--poll 15] [--timeout 3600] [--max-runs 10]' + '\n' + 'Run <command> (your agent, one turn) whenever a round or answer is owed. Stops: 0 human/closed, 1 no progress or max runs,' + '\n' + '2 exec failed, 3 timeout. The command gets COLLAB_AS and COLLAB_NEXT.',
+  gate: 'collab-cue gate --as NAME [--ids ids]' + '\n' + 'Is the other agent\'s latest turn reviewable? Exit 0 ready, 1 not. --ids overrides the cue\'s expected ids.',
+  ack: 'collab-cue ack --as NAME' + '\n' + 'Mark the current cue as consumed.',
+  commit: 'collab-cue commit --as NAME' + '\n' + 'Record the report as reviewed; prints the round number.',
+  append: 'collab-cue append --as NAME [--file path]' + '\n' + 'Append an entry at EOF (stdin if no --file). It must start with "### NAME - title"; use "####" below.' + '\n' + 'Refuses control bytes, a heading naming someone else, and extra ### headings.',
+  tail: 'collab-cue tail --as NAME' + '\n' + 'Print the other agent\'s latest turn (every consecutive entry since your last one).',
+  close: 'collab-cue close --as NAME --open 0' + '\n' + 'Close the collaboration. Refuses unless --open is 0 and the ringer\'s expected ids are all answered.',
+  selftest: 'collab-cue selftest' + '\n' + 'Run the built-in checks in-process.',
+};
+
 function dispatch(argv) {
   const cmd = argv[0];
-  if (!cmd) { io.out(USAGE); throw new Exit(0); }
+  if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') { io.out(USAGE); throw new Exit(0); }
+  if (Object.hasOwn(HELP, cmd) && argv.slice(1).some((x) => x === '--help' || x === '-h')) { io.out(HELP[cmd] + '\n'); throw new Exit(0); }
   if (!Object.hasOwn(CMDS, cmd)) { io.out(USAGE); throw new Exit(1); }
   const f = parseFlags(cmd, argv.slice(1));
   const a = { root: f.root ?? process.cwd(), report: f.report, as: f.as || process.env.COLLAB_AS || undefined };
